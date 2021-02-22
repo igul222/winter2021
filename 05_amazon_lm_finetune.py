@@ -1,3 +1,8 @@
+"""
+Train a 4096-dim LSTM as a character-level LM and finetune it as a sentiment
+classifier.
+"""
+
 import argparse
 import lib.utils
 import numpy as np
@@ -6,7 +11,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 from tqdm import tqdm
-
 
 # Run 03_amazon_preprocess.py to generate this file.
 AMAZON_PATH = os.path.expanduser('~/data/amazon_reviews/all_reviews.txt')
@@ -136,10 +140,10 @@ class LSTM(nn.Module):
         x = self.embedding(x)
         all_h, (h_t, c_t) = self.lstm(x, (h0, c0))
         logits = self.readout(all_h)
-        return logits, h_t.detach(), c_t.detach()
+        return logits, h_t.detach(), c_t.detach(), all_h
 
-model = LSTM().cuda()
-opt = optim.Adam(model.parameters(), lr=5e-4)
+lstm = LSTM().cuda()
+opt = optim.Adam(lstm.parameters(), lr=5e-4)
 h0 = torch.zeros([1, BATCH_SIZE, LSTM_DIM]).cuda()
 c0 = torch.zeros([1, BATCH_SIZE, LSTM_DIM]).cuda()
 step = 0
@@ -150,7 +154,7 @@ def forward():
         h0.zero_()
         c0.zero_()
     step += 1
-    logits, h0, c0 = model(inputs, h0, c0)
+    logits, h0, c0, _ = lstm(inputs, h0, c0)
     logits = logits[:, NGRAM_N-1:-1, :]
     targets = inputs[:, NGRAM_N:]
     if args.ngram_enabled:
@@ -166,10 +170,10 @@ if args.load_weights_path is None:
     lib.utils.train_loop(forward, opt, steps=LSTM_STEPS,
         print_freq=PRINT_FREQ)
     print('Saving LSTM weights...')
-    torch.save(model.state_dict(), 'lstm.pt')
+    torch.save(lstm.state_dict(), 'lstm.pt')
 else:
     weights = torch.load(os.path.join(args.load_weights_path, 'lstm.pt'))
-    model.load_state_dict(weights)
+    lstm.load_state_dict(weights)
 
 
 def load_sst(split, n=None):
@@ -193,49 +197,60 @@ def load_sst(split, n=None):
         X = [x for i,x in enumerate(X) if i in idx]
         y = [y_ for i, y_ in enumerate(y) if i in idx]
 
-    # Extract features
-    X_feats = []
-    for x in tqdm(X):
-        with torch.no_grad():
-            h0 = torch.zeros([1, 1, LSTM_DIM]).cuda()
-            c0 = torch.zeros([1, 1, LSTM_DIM]).cuda()
-            _, ht, ct = model(x[None, :], h0, c0)
-            feats = ht.view(-1)
-        X_feats.append(feats)
+    lengths = torch.tensor([len(x) for x in X], device='cuda')
+    X = nn.utils.rnn.pad_sequence(X, batch_first=True).cuda()
+    y = torch.tensor(y).cuda()
 
-    return torch.stack(X_feats, dim=0).cuda(), torch.tensor(y).cuda()
+    return X, lengths, y
 
 def multiclass_accuracy(y_pred, y):
     return torch.argmax(y_pred, dim=-1).eq(y).float()
 
 print('Loading SST:')
-X_train, y_train = load_sst('train', args.sst_train_size)
-X_dev, y_dev = load_sst('dev')
-X_test, y_test = load_sst('test')
+X_train, lengths_train, y_train = load_sst('train', args.sst_train_size)
+X_dev, lengths_dev, y_dev = load_sst('dev')
+X_test, lengths_test, y_test = load_sst('test')
 
 print('Training SST model:')
 
-if args.weight_decay:
-    weight_decay_vals = [1e1, 1e0, 1e-1, 1e-2, 1e-3, 1e-4, 0.]
-else:
-    weight_decay_vals = [0.]
+classifier = nn.Linear(LSTM_DIM, 2).cuda()
+def forward():
+    idx = torch.randperm(X_train.shape[0])[:BATCH_SIZE]
+    lengths, X, y = lengths_train[idx], X_train[idx], y_train[idx]
+    X = X[:, :lengths.max()]
+    h0 = torch.zeros([1, X.shape[0], LSTM_DIM]).cuda()
+    c0 = torch.zeros([1, X.shape[0], LSTM_DIM]).cuda()
+    _, _, _, all_h = lstm(X, h0, c0)
+    logits = classifier(all_h[torch.arange(X.shape[0]), lengths-1])
+    loss = F.cross_entropy(logits, y)
+    acc = multiclass_accuracy(logits, y).mean()
+    return loss, acc
 
-best_decay = None
-best_dev_acc = 0.
-best_test_acc = 0.
-for decay in weight_decay_vals:
-    model = nn.Linear(X_train.shape[1], 2).cuda()
-    def forward():
-        logits = model(X_train)
-        loss = F.cross_entropy(logits, y_train)
-        acc = multiclass_accuracy(logits, y_train).mean()
-        return loss, acc
-    opt = optim.Adam(model.parameters(), weight_decay=decay)
-    lib.utils.train_loop(forward, opt, 1000, ['acc'], print_freq=100)
-    dev_acc = multiclass_accuracy(model(X_dev), y_dev).mean().item()
-    if dev_acc > best_dev_acc:
-        best_decay = decay
-        best_dev_acc = dev_acc
-        best_test_acc = multiclass_accuracy(model(X_test), y_test).mean().item()
-    print(f'Decay {decay}: dev acc {dev_acc}')
-print(f'Best SST result: decay {best_decay}, test acc {best_test_acc}')
+def eval_fn():
+    X, lengths, y = X_test, lengths_test, y_test
+    accs = []
+    with torch.no_grad():
+        for i in range(0, X.shape[0], BATCH_SIZE):
+            X_ = X[i:i+BATCH_SIZE]
+            lengths_ = lengths[i:i+BATCH_SIZE]
+            y_ = y[i:i+BATCH_SIZE]
+            X = X[:, :lengths.max()]
+            h0 = torch.zeros([1, X_.shape[0], LSTM_DIM]).cuda()
+            c0 = torch.zeros([1, X_.shape[0], LSTM_DIM]).cuda()
+            _, _, _, all_h = lstm(X_, h0, c0)
+            logits = classifier(all_h[torch.arange(X_.shape[0]), lengths_-1])
+            acc = multiclass_accuracy(logits, y_).mean()
+            accs.append(acc)
+    print(f'Test acc:', torch.stack(accs).mean().item())
+
+opt = optim.Adam(classifier.parameters(), lr=5e-4, weight_decay=0.01)
+lib.utils.train_loop(forward, opt, 1000, ['acc'], print_freq=100)
+eval_fn()
+
+opt = optim.Adam([
+    {'params': lstm.parameters(), 'lr':5e-4},
+    {'params': classifier.parameters(), 'lr':5e-4}
+])
+lib.utils.train_loop(forward, opt, 2*X_train.shape[0]//BATCH_SIZE,
+    ['acc'])
+eval_fn()
