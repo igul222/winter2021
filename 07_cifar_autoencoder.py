@@ -21,6 +21,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--noise', type=float, default=0.3)
 parser.add_argument('--max_rotation', type=float, default=0.)
 parser.add_argument('--augment_cond', action='store_true')
+parser.add_argument('--aug_mode', default='none')
 args = parser.parse_args()
 print('Args:')
 for k,v in sorted(vars(args).items()):
@@ -77,11 +78,27 @@ def forward():
     x, y = x.cuda(), y.cuda()
     x = (2*x) - 1 # Rescale to [-1, 1]
 
-    x, theta = augment(x)
+    if args.aug_mode == 'none':
+        x_enc = x
+        x_dec = x
+        theta = torch.zeros((x.shape[0], 1), device='cuda')
+    elif args.aug_mode == 'encoder_only':
+        x_dec = x
+        x_enc, _ = augment(x)
+        theta = torch.zeros((x.shape[0], 1), device='cuda')
+    elif args.aug_mode == 'decoder_only':
+        x_enc = x
+        x_dec, theta = augment(x)
+    elif args.aug_mode == 'same':
+        x_enc, theta = augment(x)
+        x_dec = x_enc
+    elif args.aug_mode == 'different':
+        x_enc, _ = augment(x)
+        x_dec, theta = augment(x)
 
-    _, z_noisy = encoder(x)
+    _, z_noisy = encoder(x_enc)
     x_reconst = decoder(z_noisy, theta.cuda())
-    loss = (x - x_reconst).pow(2).mean()
+    loss = (x_dec - x_reconst).pow(2).mean()
     return loss
 opt = optim.Adam(list(encoder.parameters())+list(decoder.parameters()), lr=3e-4)
 
