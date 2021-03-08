@@ -43,6 +43,9 @@ def train_loop(forward, opt, steps, history_names=[], hook=None,
         scaler.step(opt)
         scaler.update()
 
+        if hook is not None:
+            hook(step)
+
         histories['loss'].append(forward_vals[0].item())
         for name, val in zip(history_names, forward_vals[1:]):
             histories[name].append(val.item())
@@ -55,6 +58,4 @@ def train_loop(forward, opt, steps, history_names=[], hook=None,
                     np.mean(histories['loss']),
                     *[np.mean(histories[name]) for name in history_names]
                 )
-            if hook is not None:
-                hook(step)
             histories.clear()

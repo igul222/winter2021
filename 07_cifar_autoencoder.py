@@ -2,67 +2,82 @@
 Semi-supervised classification from autoencoder representations on CIFAR-10.
 """
 
+import argparse
+import lib.ops
 import lib.utils
 import os
 import torch
 import torch.nn.functional as F
 import torchvision
+import torchvision.transforms as T
 from torch import nn, optim
 
 BATCH_SIZE = 128
-Z_DIM = 128
+AUGMENT_BS = 16
+STEPS = 20*1000
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--noise', type=float, default=0.1)
+parser.add_argument('--max_rotation', type=float, default=0.)
+parser.add_argument('--augment_cond', action='store_true')
+args = parser.parse_args()
+print('Args:')
+for k,v in sorted(vars(args).items()):
+    print(f'\t{k}: {v}')
 
 dataset = torchvision.datasets.CIFAR10(os.path.expanduser('~/data'),
     download=True, transform=torchvision.transforms.ToTensor())
 loader = torch.utils.data.DataLoader(dataset, BATCH_SIZE, shuffle=True,
-    pin_memory=True, num_workers=4)
+    pin_memory=True, num_workers=4, drop_last=True)
 def _():
     while True:
         yield from loader
 inf_loader = _()
 
-class Model(nn.Module):
+class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 64, 5, padding=2, stride=2)
-        self.conv2 = nn.Conv2d(64, 128, 5, padding=2, stride=2)
-        self.conv3 = nn.Conv2d(128, 256, 5, padding=2, stride=2)
-        self.conv4 = nn.ConvTranspose2d(256, 128, 5, padding=2, stride=2, output_padding=1)
-        self.conv5 = nn.ConvTranspose2d(128, 64, 5, padding=2, stride=2, output_padding=1)
-        self.conv6 = nn.ConvTranspose2d(64, 3, 5, padding=2, stride=2, output_padding=1)
-        self.linear1 = nn.Linear(4*4*256, 128)
-        self.linear2 = nn.Linear(128, 4*4*256)
+        self.encoder = lib.ops.WideResnet()
     def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = self.conv3(x)
-        x = F.relu(x)
-        z = self.linear1(x.view(x.shape[0], 4*4*256))
-        z_pre = z
+        z = self.encoder(x)
+        z = z / z.pow(2).mean(dim=1, keepdim=True).sqrt()
+        z_noisy = z + (args.noise * torch.randn_like(z))
+        return z, z_noisy
 
-        z = z * 11 / z.norm(p=2, dim=1, keepdim=True)
-        z = z + (torch.randn_like(z) * 1e-0)
+class Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.decoder = lib.ops.WideResnetDecoder()
+        self.theta_proj = nn.Linear(1, 256)
+    def forward(self, z_noisy, theta):
+        x = z_noisy
+        if args.augment_cond:
+            x = x + self.theta_proj(theta)
+        x = self.decoder(x)
+        return x
 
-        x = self.linear2(z).view(x.shape[0], 256, 4, 4)
-        x = self.conv4(x)
-        x = F.relu(x)
-        x = self.conv5(x)
-        x = F.relu(x)
-        x = self.conv6(x)
-        return x, z_pre
-
-model = Model().cuda()
+encoder = Encoder().cuda()
+decoder = Decoder().cuda()
 
 def forward():
     x, y = next(inf_loader)
     x, y = x.cuda(), y.cuda()
     x = (2*x) - 1 # Rescale to [-1, 1]
-    x_reconst, _ = model(x)
+
+    theta = (torch.rand(AUGMENT_BS, 1)*2-1)
+    theta = theta.repeat(BATCH_SIZE//AUGMENT_BS, 1)
+    x = torch.cat([
+        T.functional.rotate(
+            x[i::AUGMENT_BS],
+            (theta[i] * args.max_rotation).item(),
+            interpolation=T.InterpolationMode.BILINEAR
+        ) for i in range(AUGMENT_BS)], dim=0)
+
+    _, z_noisy = encoder(x)
+    x_reconst = decoder(z_noisy, theta.cuda())
     loss = (x - x_reconst).pow(2).mean()
     return loss
-opt = optim.Adam(model.parameters(), lr=3e-4)
+opt = optim.Adam(list(encoder.parameters())+list(decoder.parameters()), lr=3e-4)
 
 def extract_feats(train):
     dataset = torchvision.datasets.CIFAR10(os.path.expanduser('~/data'),
@@ -73,14 +88,14 @@ def extract_feats(train):
         for x, y in loader:
             x, y = x.cuda(), y.cuda()
             x = (2*x) - 1 # Rescale to [-1, 1]
-            _, z = model(x)
+            z, _ = encoder(x)
             Z.append(z)
             Y.append(y)
         Z = torch.cat(Z, dim=0)
         Y = torch.cat(Y, dim=0)
     return Z, Y
 
-def run_eval(_=None):
+def run_eval():
     # Step 1: Train a linear classifier
     Z, Y = extract_feats(train=True)
     linear_model = nn.Linear(Z.shape[1], 10).cuda()
@@ -95,5 +110,5 @@ def run_eval(_=None):
         acc = y_pred.eq(Y).float().mean()
     print('Test acc:', acc.item())
 
+lib.utils.train_loop(forward, opt, STEPS)
 run_eval()
-lib.utils.train_loop(forward, opt, 20*1000, hook=run_eval)

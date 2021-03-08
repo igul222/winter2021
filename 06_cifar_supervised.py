@@ -12,10 +12,11 @@ import torchvision
 from torch import nn, optim
 
 BATCH_SIZE = 128
+STEPS = 20*1000
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--resnet_n', type=int, default=2)
-parser.add_argument('--resnet_k', type=int, default=1)
+parser.add_argument('--resnet_n', type=int, default=1)
+parser.add_argument('--resnet_k', type=int, default=4)
 args = parser.parse_args()
 print('Args:')
 for k,v in sorted(vars(args).items()):
@@ -37,10 +38,10 @@ class Model(nn.Module):
         self.classifier = nn.Linear(64*args.resnet_k, 10)
     def forward(self, x):
         x = self.resnet(x)
-        x = x.mean(dim=[2,3])
         x = self.classifier(x)
         return x
 model = Model().cuda()
+swa_model = optim.swa_utils.AveragedModel(model)
 
 def forward():
     x, y = next(inf_loader)
@@ -51,21 +52,9 @@ def forward():
     return loss
 opt = optim.Adam(model.parameters(), lr=3e-4)
 
-def extract_feats(train):
-    dataset = torchvision.datasets.CIFAR10(os.path.expanduser('~/data'),
-        transform=torchvision.transforms.ToTensor(), train=train)
-    loader = torch.utils.data.DataLoader(dataset, BATCH_SIZE, shuffle=True)
-    with torch.no_grad():
-        Z, Y = [], []
-        for x, y in loader:
-            x, y = x.cuda(), y.cuda()
-            x = (2*x) - 1 # Rescale to [-1, 1]
-            _, z = model(x)
-            Z.append(z)
-            Y.append(y)
-        Z = torch.cat(Z, dim=0)
-        Y = torch.cat(Y, dim=0)
-    return Z, Y
+def hook(step):
+    if step > (STEPS*0.75):
+        swa_model.update_parameters(model)
 
 def run_eval():
     accs = []
@@ -76,10 +65,10 @@ def run_eval():
         for x, y in loader:
             x, y = x.cuda(), y.cuda()
             x = (2*x) - 1 # Rescale to [-1, 1]
-            logits = model(x)
+            logits = swa_model(x)
             acc = logits.argmax(dim=1).eq(y).float()
             accs.append(acc)
     print('Test acc:', torch.cat(accs).mean().item())
 
-lib.utils.train_loop(forward, opt, 20*1000)
+lib.utils.train_loop(forward, opt, STEPS)
 run_eval()

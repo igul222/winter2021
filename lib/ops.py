@@ -17,9 +17,9 @@ class ResBlock(nn.Module):
         return x + x_shortcut
 
 class WideResnet(nn.Module):
-    """WRN without the final mean-pool. I handle the downsampling slightly
-    differently, for simplicity."""
-    def __init__(self, N=2, k=1):
+    """WRN. I handle the downsampling slightly differently, for simplicity.
+    The default settings (N=1, k=4) correspond to WRN-10-4."""
+    def __init__(self, N=1, k=4):
         super().__init__()
         self.conv1 = nn.Conv2d(3, 16*k, 3, padding=1)
         self.conv2 = nn.Sequential(*[ResBlock(16*k) for _ in range(N)])
@@ -34,21 +34,23 @@ class WideResnet(nn.Module):
         x = self.conv3(x)
         x = self.pre_conv4(x)
         x = self.conv4(x)
+        x = x.mean(dim=[2,3])
         return x
 
 class WideResnetDecoder(nn.Module):
     """Decoder network that's exactly a mirror-image of WRN."""
-    def __init__(self, N=2, k=1):
+    def __init__(self, N=1, k=4):
         super().__init__()
-        self.conv1 = nn.Conv2d(3, 16*k, 3, padding=1)
+        self.conv1 = nn.Conv2d(16*k, 3, 3, padding=1)
         self.conv2 = nn.Sequential(*[ResBlock(16*k) for _ in range(N)])
-        self.pre_conv3 = nn.Conv2dTranspose(32*k, 16*k, 1, stride=2,
+        self.pre_conv3 = nn.ConvTranspose2d(32*k, 16*k, 1, stride=2,
             output_padding=1, bias=False)
         self.conv3 = nn.Sequential(*[ResBlock(32*k) for _ in range(N)])
-        self.pre_conv4 = nn.Conv2dTranspose(64*k, 32*k, 1, stride=2,
+        self.pre_conv4 = nn.ConvTranspose2d(64*k, 32*k, 1, stride=2,
             output_padding=1, bias=False)
         self.conv4 = nn.Sequential(*[ResBlock(64*k) for _ in range(N)])
     def forward(self, x):
+        x = x[:,:,None,None].repeat(1,1,8,8)
         x = self.conv4(x)
         x = self.pre_conv4(x)
         x = self.conv3(x)
