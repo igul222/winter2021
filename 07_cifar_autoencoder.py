@@ -5,6 +5,7 @@ Semi-supervised classification from autoencoder representations on CIFAR-10.
 import argparse
 import lib.ops
 import lib.utils
+import numpy as np
 import os
 import torch
 import torch.nn.functional as F
@@ -59,19 +60,24 @@ class Decoder(nn.Module):
 encoder = Encoder().cuda()
 decoder = Decoder().cuda()
 
+def augment(x):
+    theta = (torch.rand(AUGMENT_BS, 1)*2-1)
+    theta = theta.repeat_interleave(int(np.ceil(x.shape[0]/AUGMENT_BS)), dim=0)
+    theta = theta[:x.shape[0]]
+    x = torch.cat([
+        T.functional.rotate(
+            x[i:i+AUGMENT_BS],
+            (theta[i] * args.max_rotation).item(),
+            interpolation=T.InterpolationMode.BILINEAR
+        ) for i in range(0, x.shape[0], AUGMENT_BS)], dim=0)
+    return x, theta
+
 def forward():
     x, y = next(inf_loader)
     x, y = x.cuda(), y.cuda()
     x = (2*x) - 1 # Rescale to [-1, 1]
 
-    theta = (torch.rand(AUGMENT_BS, 1)*2-1)
-    theta = theta.repeat(BATCH_SIZE//AUGMENT_BS, 1)
-    x = torch.cat([
-        T.functional.rotate(
-            x[i::AUGMENT_BS],
-            (theta[i] * args.max_rotation).item(),
-            interpolation=T.InterpolationMode.BILINEAR
-        ) for i in range(AUGMENT_BS)], dim=0)
+    x, theta = augment(x)
 
     _, z_noisy = encoder(x)
     x_reconst = decoder(z_noisy, theta.cuda())
