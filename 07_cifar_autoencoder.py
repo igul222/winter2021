@@ -17,7 +17,7 @@ AUGMENT_BS = 16
 STEPS = 20*1000
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--noise', type=float, default=0.1)
+parser.add_argument('--noise', type=float, default=0.3)
 parser.add_argument('--max_rotation', type=float, default=0.)
 parser.add_argument('--augment_cond', action='store_true')
 args = parser.parse_args()
