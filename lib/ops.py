@@ -3,6 +3,39 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 
+class CausalConv(nn.Module):
+    def __init__(self, dim_in, dim_out, kernel_size, n_groups):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.randn((dim_out, dim_in, kernel_size, kernel_size)))
+        self.bias = nn.Parameter(
+            torch.zeros((dim_out,)))
+        assert(kernel_size%2 == 1)
+        self.padding = kernel_size // 2
+        self.weight.data /= float(np.sqrt(kernel_size**2 * dim_in))
+        self.mask = torch.ones((dim_out, dim_in, kernel_size, kernel_size))
+        self.mask[:,:,(kernel_size//2)+1:,:] *= 0.
+        self.mask[:,:,kernel_size//2,(kernel_size//2)+1:] *= 0.
+        for i in range(n_groups):
+            for j in range(i, n_groups):
+                self.mask[j::n_groups,i::n_groups,
+                    kernel_size//2,kernel_size//2] *= 0.
+        self.mask = self.mask.cuda()
+    def forward(self, x):
+        weight = self.weight * self.mask
+        return F.conv2d(x, weight, self.bias, padding=self.padding)
+
+class CausalResBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv1 = CausalConv(dim, dim, 5, 3)
+        self.conv2 = CausalConv(dim, dim, 5, 3)
+    def forward(self, x):
+        x_shortcut = x
+        x = self.conv1(F.relu(x))
+        x = self.conv2(F.relu(x))
+        return x_shortcut + (0.5 * x)
+
 class ResBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()

@@ -51,13 +51,57 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.decoder = lib.ops.WideResnetDecoder()
+        self.decoder = lib.ops.WideResnetDecoder(dim_out=64)
         self.theta_proj = nn.Linear(2, 256)
-    def forward(self, z_noisy, theta):
+        self.norm = nn.GroupNorm(8, 64)
+        self.embedding = nn.Embedding(256, 64)
+
+        # self.embedding = nn.Embedding(256, 22)
+        # self.causal1 = lib.ops.CausalResBlock(64)
+        # self.causal2 = lib.ops.CausalResBlock(64)
+        # self.causal3 = lib.ops.CausalResBlock(64)
+        # self.causal_out = lib.ops.CausalConv(64, 3*256, 1, 3)
+
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=256,
+            num_layers=1,
+            batch_first=True
+        )
+        self.lstm = nn.utils.weight_norm(self.lstm, 'weight_ih_l0')
+        self.lstm = nn.utils.weight_norm(self.lstm, 'weight_hh_l0')
+        self.readout = nn.Linear(256, 256)
+
+    def forward(self, z_noisy, theta, x_target):
         x = z_noisy
         if args.augment_cond:
             x = x + self.theta_proj(theta)
         x = self.decoder(x)
+
+        x = self.norm(x)
+
+        x = x.repeat_interleave(3,dim=1).view(-1,64,3,32,32).permute(0,2,3,4,1).reshape(-1,3*32*32,64)
+        x_target_embed = self.embedding(x_target).view(x_target.shape[0], 3*32*32, 64)
+        x_target_embed = torch.cat([
+            torch.zeros_like(x_target_embed[:,0:1,:]),
+            x_target_embed[:,:-1,:]
+        ], dim=1)
+        x,_ = self.lstm(x + x_target_embed)
+        x = self.readout(x)
+        x = x.reshape(-1,3,32,32,256).permute(0,4,1,2,3)
+
+        # x_target_embed = self.embedding(x_target).permute(0,4,1,2,3)
+        # x_target_embed = x_target_embed.reshape(
+        #     x_target_embed.shape[0], 22*3, 32, 32)
+        # x = x + x_target_embed[:, :64, :, :]
+
+        # x = self.causal1(x)
+        # x = self.causal2(x)
+        # x = self.causal3(x)
+        # x = F.relu(x)
+        # x = self.causal_out(x)
+        # x = x.view(x.shape[0], 256, 3, 32, 32)
+
         return x
 
 encoder = Encoder().cuda()
@@ -87,6 +131,9 @@ def augment(x):
     theta = torch.stack([theta1, theta2], dim=1)
     return x, theta
 
+def quantize(x):
+    return (x*255.).long().clamp(min=0, max=255)
+
 def forward():
     x, y = next(inf_loader)
     x, y = x.cuda(), y.cuda()
@@ -109,13 +156,13 @@ def forward():
         x_enc, _ = augment(x)
         x_dec, theta = augment(x)
 
-    # Rescale to [-1, 1]
     x_enc = (2*x_enc) - 1
-    x_dec = (2*x_dec) - 1
+    x_dec = quantize(x_dec)
 
     _, z_noisy = encoder(x_enc)
-    x_reconst = decoder(z_noisy, theta.cuda())
-    loss = (x_dec - x_reconst).pow(2).mean()
+    x_reconst = decoder(z_noisy, theta.cuda(), x_dec)
+    loss = F.cross_entropy(x_reconst, x_dec)
+    # loss = (x_dec - x_reconst).pow(2).mean()
     return loss
 opt = optim.Adam(list(encoder.parameters())+list(decoder.parameters()), lr=3e-4)
 
@@ -150,5 +197,5 @@ def run_eval():
         acc = y_pred.eq(Y).float().mean()
     print('Test acc:', acc.item())
 
-lib.utils.train_loop(forward, opt, STEPS)
+lib.utils.train_loop(forward, opt, STEPS, print_freq=10)
 run_eval()
