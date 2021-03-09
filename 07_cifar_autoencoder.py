@@ -16,7 +16,7 @@ from functools import partial
 
 BATCH_SIZE = 128
 AUGMENT_BS = 16
-STEPS = 20*1000
+STEPS = 80001
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--noise', type=float, default=0.3)
@@ -64,13 +64,13 @@ class Decoder(nn.Module):
 
         self.lstm = nn.LSTM(
             input_size=64,
-            hidden_size=256,
+            hidden_size=512,
             num_layers=1,
             batch_first=True
         )
         self.lstm = nn.utils.weight_norm(self.lstm, 'weight_ih_l0')
         self.lstm = nn.utils.weight_norm(self.lstm, 'weight_hh_l0')
-        self.readout = nn.Linear(256, 256)
+        self.readout = nn.Linear(512, 256)
 
     def forward(self, z_noisy, theta, x_target):
         x = z_noisy
@@ -80,15 +80,15 @@ class Decoder(nn.Module):
 
         x = self.norm(x)
 
-        x = x.repeat_interleave(3,dim=1).view(-1,64,3,32,32).permute(0,2,3,4,1).reshape(-1,3*32*32,64)
-        x_target_embed = self.embedding(x_target).view(x_target.shape[0], 3*32*32, 64)
+        x = x.repeat_interleave(3,dim=1).view(-1,64,3,32,32).permute(0,3,4,2,1).reshape(-1,32*32*3,64)
+        x_target_embed = self.embedding(x_target).permute(0,2,3,1,4).reshape(x_target.shape[0], 32*32*3, 64)
         x_target_embed = torch.cat([
             torch.zeros_like(x_target_embed[:,0:1,:]),
             x_target_embed[:,:-1,:]
         ], dim=1)
         x,_ = self.lstm(x + x_target_embed)
         x = self.readout(x)
-        x = x.reshape(-1,3,32,32,256).permute(0,4,1,2,3)
+        x = x.reshape(-1,32,32,3,256).permute(0,4,3,1,2)
 
         # x_target_embed = self.embedding(x_target).permute(0,4,1,2,3)
         # x_target_embed = x_target_embed.reshape(
@@ -141,11 +141,11 @@ def forward():
     if args.augment_mode == 'none':
         x_enc = x
         x_dec = x
-        theta = torch.zeros((x.shape[0], 1), device='cuda')
+        theta = torch.zeros((x.shape[0], 2), device='cuda')
     elif args.augment_mode == 'encoder_only':
         x_dec = x
         x_enc, _ = augment(x)
-        theta = torch.zeros((x.shape[0], 1), device='cuda')
+        theta = torch.zeros((x.shape[0], 2), device='cuda')
     elif args.augment_mode == 'decoder_only':
         x_enc = x
         x_dec, theta = augment(x)
@@ -182,7 +182,9 @@ def extract_feats(train):
         Y = torch.cat(Y, dim=0)
     return Z, Y
 
-def run_eval():
+def run_eval(step):
+    if step not in [0, 20*1000, 40*1000, 80*1000]:
+        return
     # Step 1: Train a linear classifier
     Z, Y = extract_feats(train=True)
     linear_model = nn.Linear(Z.shape[1], 10).cuda()
@@ -197,5 +199,4 @@ def run_eval():
         acc = y_pred.eq(Y).float().mean()
     print('Test acc:', acc.item())
 
-lib.utils.train_loop(forward, opt, STEPS, print_freq=10)
-run_eval()
+lib.utils.train_loop(forward, opt, STEPS, hook=run_eval)
