@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 from torch import nn, optim
+from functools import partial
 
 BATCH_SIZE = 128
 AUGMENT_BS = 16
@@ -19,9 +20,10 @@ STEPS = 20*1000
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--noise', type=float, default=0.3)
-parser.add_argument('--max_rotation', type=float, default=0.)
+parser.add_argument('--rotation', type=float, default=0.)
+parser.add_argument('--hue', type=float, default=0.)
 parser.add_argument('--augment_cond', action='store_true')
-parser.add_argument('--aug_mode', default='none')
+parser.add_argument('--augment_mode', default='none')
 args = parser.parse_args()
 print('Args:')
 for k,v in sorted(vars(args).items()):
@@ -30,7 +32,7 @@ for k,v in sorted(vars(args).items()):
 dataset = torchvision.datasets.CIFAR10(os.path.expanduser('~/data'),
     download=True, transform=torchvision.transforms.ToTensor())
 loader = torch.utils.data.DataLoader(dataset, BATCH_SIZE, shuffle=True,
-    pin_memory=True, num_workers=4, drop_last=True)
+    pin_memory=True, num_workers=8, drop_last=True)
 def _():
     while True:
         yield from loader
@@ -50,7 +52,7 @@ class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.decoder = lib.ops.WideResnetDecoder()
-        self.theta_proj = nn.Linear(1, 256)
+        self.theta_proj = nn.Linear(2, 256)
     def forward(self, z_noisy, theta):
         x = z_noisy
         if args.augment_cond:
@@ -61,40 +63,55 @@ class Decoder(nn.Module):
 encoder = Encoder().cuda()
 decoder = Decoder().cuda()
 
-def augment(x):
-    theta = (torch.rand(AUGMENT_BS, 1)*2-1)
-    theta = theta.repeat_interleave(int(np.ceil(x.shape[0]/AUGMENT_BS)), dim=0)
-    theta = theta[:x.shape[0]]
+def _apply(x, scale, fn):
+    """
+    Shuffle x, apply fn on groups of consecutive samples, then unshuffle.
+    """
+    perm = torch.randperm(x.shape[0], device='cuda')
+    inv_perm = torch.argsort(perm)
+    x = x[perm]
+    theta = torch.rand(1+(x.shape[0]//AUGMENT_BS), device='cuda')*2 - 1
+    theta = theta.repeat_interleave(AUGMENT_BS)[:x.shape[0]]
     x = torch.cat([
-        T.functional.rotate(
-            x[i:i+AUGMENT_BS],
-            (theta[i] * args.max_rotation).item(),
-            interpolation=T.InterpolationMode.BILINEAR
-        ) for i in range(0, x.shape[0], AUGMENT_BS)], dim=0)
+        fn(x[i:i+AUGMENT_BS], (theta[i] * scale).item())
+        for i in range(0, x.shape[0], AUGMENT_BS)
+    ], dim=0)
+    x, theta = x[inv_perm], theta[inv_perm]
+    return x, theta
+
+def augment(x):
+    x, theta1 = _apply(x, args.rotation * 180., partial(T.functional.rotate,
+        interpolation=T.InterpolationMode.BILINEAR))
+    x, theta2 = _apply(x, args.hue * 0.5, T.functional.adjust_hue)
+
+    theta = torch.stack([theta1, theta2], dim=1)
     return x, theta
 
 def forward():
     x, y = next(inf_loader)
     x, y = x.cuda(), y.cuda()
-    x = (2*x) - 1 # Rescale to [-1, 1]
 
-    if args.aug_mode == 'none':
+    if args.augment_mode == 'none':
         x_enc = x
         x_dec = x
         theta = torch.zeros((x.shape[0], 1), device='cuda')
-    elif args.aug_mode == 'encoder_only':
+    elif args.augment_mode == 'encoder_only':
         x_dec = x
         x_enc, _ = augment(x)
         theta = torch.zeros((x.shape[0], 1), device='cuda')
-    elif args.aug_mode == 'decoder_only':
+    elif args.augment_mode == 'decoder_only':
         x_enc = x
         x_dec, theta = augment(x)
-    elif args.aug_mode == 'same':
+    elif args.augment_mode == 'same':
         x_enc, theta = augment(x)
         x_dec = x_enc
-    elif args.aug_mode == 'different':
+    elif args.augment_mode == 'different':
         x_enc, _ = augment(x)
         x_dec, theta = augment(x)
+
+    # Rescale to [-1, 1]
+    x_enc = (2*x_enc) - 1
+    x_dec = (2*x_dec) - 1
 
     _, z_noisy = encoder(x_enc)
     x_reconst = decoder(z_noisy, theta.cuda())
