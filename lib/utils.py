@@ -25,7 +25,7 @@ def print_row(*row, colwidth=16):
     print("  ".join([format_val(x) for x in row]))
 
 def train_loop(forward, opt, steps, history_names=[], hook=None,
-    print_freq=1000, quiet=False):
+    print_freq=1000, scheduler=None, quiet=False):
 
     if not quiet:
         print_row('step', 'step time', 'loss', *history_names)
@@ -42,6 +42,9 @@ def train_loop(forward, opt, steps, history_names=[], hook=None,
         scaler.scale(forward_vals[0]).backward()
         scaler.step(opt)
         scaler.update()
+
+        if scheduler is not None:
+            scheduler.step()
 
         if hook is not None:
             hook(step)

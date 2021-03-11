@@ -33,16 +33,17 @@ class Decoder(nn.Module):
         self.embedding = nn.Embedding(256, 64)
         self.lstm = nn.LSTM(
             input_size=64,
-            hidden_size=512,
+            hidden_size=1024,
             num_layers=1,
             batch_first=True
         )
         self.lstm = nn.utils.weight_norm(self.lstm, 'weight_ih_l0')
         self.lstm = nn.utils.weight_norm(self.lstm, 'weight_hh_l0')
-        self.readout = nn.Linear(512, 256)
+        self.readout = nn.Linear(1024, 256)
 
     def forward(self, x_target):
-        x_target_embed = self.embedding(x_target).permute(0,2,3,1,4).reshape(x_target.shape[0], 32*32*3, 64)
+        x_target_embed = self.embedding(x_target).permute(0,2,3,1,4).reshape(
+            x_target.shape[0], 32*32*3, 64)
         x_target_embed = torch.cat([
             torch.zeros_like(x_target_embed[:,0:1,:]),
             x_target_embed[:,:-1,:]
@@ -64,7 +65,8 @@ def forward():
     x_reconst = decoder(x_quant)
     loss = F.cross_entropy(x_reconst, x_quant) / 0.693147
     return loss
-opt = optim.Adam(decoder.parameters(), lr=3e-4)
+opt = optim.Adam(decoder.parameters(), lr=5e-4)
+scheduler = optim.lr_scheduler.LambdaLR(opt, lambda step: 1-(step/STEPS))
 
 def run_eval(step):
     if step % 10000 != 0:
@@ -84,5 +86,6 @@ def run_eval(step):
                 losses.append(loss)
     print('Test loss (BPC):', torch.cat(losses).mean().item() / 0.693147)
 
-lib.utils.train_loop(forward, opt, STEPS, hook=run_eval, print_freq=10)
+lib.utils.train_loop(forward, opt, STEPS, hook=run_eval, scheduler=scheduler)
+
 run_eval(0)

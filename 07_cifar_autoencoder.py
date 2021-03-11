@@ -16,7 +16,7 @@ from functools import partial
 
 BATCH_SIZE = 128
 AUGMENT_BS = 16
-STEPS = 80001
+STEPS = 40001
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--noise', type=float, default=0.3)
