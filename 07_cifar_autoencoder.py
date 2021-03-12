@@ -17,13 +17,17 @@ from functools import partial
 BATCH_SIZE = 128
 AUGMENT_BS = 16
 STEPS = 40001
+PRINT_FREQ = 1000
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--augment_cond', action='store_true')
+parser.add_argument('--augment_mode', default='none')
+parser.add_argument('--resnet_n', type=int, default=1)
+parser.add_argument('--k', type=int, default=4)
 parser.add_argument('--noise', type=float, default=0.3)
 parser.add_argument('--rotation', type=float, default=0.)
 parser.add_argument('--hue', type=float, default=0.)
-parser.add_argument('--augment_cond', action='store_true')
-parser.add_argument('--augment_mode', default='none')
+parser.add_argument('--q_levels', type=int, default=2048)
 args = parser.parse_args()
 print('Args:')
 for k,v in sorted(vars(args).items()):
@@ -41,7 +45,7 @@ inf_loader = _()
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = lib.ops.WideResnet()
+        self.encoder = lib.ops.WideResnet(N=args.resnet_n, k=args.k)
     def forward(self, x):
         z = self.encoder(x)
         z = z / z.pow(2).mean(dim=1, keepdim=True).sqrt()
@@ -51,26 +55,21 @@ class Encoder(nn.Module):
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.decoder = lib.ops.WideResnetDecoder(dim_out=64)
-        self.theta_proj = nn.Linear(2, 256)
-        self.norm = nn.GroupNorm(8, 64)
-        self.embedding = nn.Embedding(256, 64)
+        self.decoder = lib.ops.WideResnetDecoder(N=args.resnet_n, k=args.k, dim_out=16*args.k)
+        self.theta_proj = nn.Linear(2, 64*args.k)
+        self.norm = nn.GroupNorm(8, 16*args.k)
+        self.embedding = nn.Embedding(args.q_levels, 16*args.k)
 
-        # self.embedding = nn.Embedding(256, 22)
-        # self.causal1 = lib.ops.CausalResBlock(64)
-        # self.causal2 = lib.ops.CausalResBlock(64)
-        # self.causal3 = lib.ops.CausalResBlock(64)
-        # self.causal_out = lib.ops.CausalConv(64, 3*256, 1, 3)
-
+        LSTM_DIM = 512
         self.lstm = nn.LSTM(
-            input_size=64,
-            hidden_size=512,
+            input_size=16*args.k,
+            hidden_size=LSTM_DIM,
             num_layers=1,
             batch_first=True
         )
         self.lstm = nn.utils.weight_norm(self.lstm, 'weight_ih_l0')
         self.lstm = nn.utils.weight_norm(self.lstm, 'weight_hh_l0')
-        self.readout = nn.Linear(512, 256)
+        self.readout = nn.Linear(LSTM_DIM, args.q_levels)
 
     def forward(self, z_noisy, theta, x_target):
         x = z_noisy
@@ -80,27 +79,15 @@ class Decoder(nn.Module):
 
         x = self.norm(x)
 
-        x = x.repeat_interleave(3,dim=1).view(-1,64,3,32,32).permute(0,3,4,2,1).reshape(-1,32*32*3,64)
-        x_target_embed = self.embedding(x_target).permute(0,2,3,1,4).reshape(x_target.shape[0], 32*32*3, 64)
+        x = x.view(x.shape[0],16*args.k,32*32).permute(0,2,1)
+        x_target_embed = self.embedding(x_target)
         x_target_embed = torch.cat([
             torch.zeros_like(x_target_embed[:,0:1,:]),
             x_target_embed[:,:-1,:]
         ], dim=1)
-        x,_ = self.lstm(x + x_target_embed)
+        x = x + x_target_embed
+        x, _ = self.lstm(x)
         x = self.readout(x)
-        x = x.reshape(-1,32,32,3,256).permute(0,4,3,1,2)
-
-        # x_target_embed = self.embedding(x_target).permute(0,4,1,2,3)
-        # x_target_embed = x_target_embed.reshape(
-        #     x_target_embed.shape[0], 22*3, 32, 32)
-        # x = x + x_target_embed[:, :64, :, :]
-
-        # x = self.causal1(x)
-        # x = self.causal2(x)
-        # x = self.causal3(x)
-        # x = F.relu(x)
-        # x = self.causal_out(x)
-        # x = x.view(x.shape[0], 256, 3, 32, 32)
 
         return x
 
@@ -132,7 +119,31 @@ def augment(x):
     return x, theta
 
 def quantize(x):
-    return (x*255.).long().clamp(min=0, max=255)
+    """
+    input: (n, 3, 32, 32) floats in [0, 1]
+    output: (n, 32*32) ints in [0, Q_LEVELS)
+    """
+    q_levels = int(np.cbrt(args.q_levels))
+    x = x*255/256 # [0, 1)
+    x = (x * q_levels) # [0, q_levels)
+    x = x.long() # ints in [0, q_levels) (*biased by 0.5 downwards)
+    x = (q_levels**2 * x[:,0,:,:]) + (q_levels * x[:,0,:,:]) + x[:,2,:,:]
+    x = x.view(x.shape[0], 32*32)
+    return x
+
+def dequantize(x):
+    """
+    input: (n, 32*32) ints in [0, Q_LEVELS)
+    output: (n, 3, 32, 32) floats in [0, 1]
+    """
+    q_levels = int(np.cbrt(args.q_levels))
+    x = x.view(x.shape[0], 32, 32)
+    x0 = (x // q_levels**2) % q_levels
+    x1 = (x // q_levels) % q_levels
+    x2 = x % q_levels
+    x = torch.stack([x0, x1, x2], dim=1) # (n, 3, 32, 32) in [0, q_levels)    
+    x = (x.float() + 0.5) / q_levels # bias-corrected and scaled to [0, 1)
+    return x
 
 def forward():
     x, y = next(inf_loader)
@@ -161,8 +172,8 @@ def forward():
 
     _, z_noisy = encoder(x_enc)
     x_reconst = decoder(z_noisy, theta.cuda(), x_dec)
-    loss = F.cross_entropy(x_reconst, x_dec)
-    # loss = (x_dec - x_reconst).pow(2).mean()
+    loss = F.cross_entropy(x_reconst.view(-1, args.q_levels),
+        x_dec.view(-1))
     return loss
 opt = optim.Adam(list(encoder.parameters())+list(decoder.parameters()), lr=3e-4)
 
@@ -183,7 +194,7 @@ def extract_feats(train):
     return Z, Y
 
 def run_eval(step):
-    if step not in [0, 20*1000, 40*1000, 80*1000]:
+    if step % 20000 != 0:
         return
     # Step 1: Train a linear classifier
     Z, Y = extract_feats(train=True)
@@ -199,4 +210,4 @@ def run_eval(step):
         acc = y_pred.eq(Y).float().mean()
     print('Test acc:', acc.item())
 
-lib.utils.train_loop(forward, opt, STEPS, hook=run_eval)
+lib.utils.train_loop(forward, opt, STEPS, hook=run_eval, print_freq=PRINT_FREQ)

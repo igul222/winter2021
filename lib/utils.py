@@ -62,3 +62,45 @@ def train_loop(forward, opt, steps, history_names=[], hook=None,
                     *[np.mean(histories[name]) for name in history_names]
                 )
             histories.clear()
+
+def save_image_grid(images, path):
+    """
+    Given a tensor representing a batch of images, arrange them into a
+    rectangular grid and save the images to the given path. The specific
+    preprocessing is inferred based on the image shape, dtype, and values.
+    Supported image formats:
+    MNIST: float, shape (N, 784), values in [0, 1]
+    Colored MNIST: float, shape (N, 2*784), channel-minor, values in [0, 1]
+    All others: byte, shape (N, H, W, C), values in [0, 255]
+    """
+    assert(torch.is_tensor(images))
+
+    if (images.shape[-1] == 784):
+        # MNIST
+        images = images.reshape((-1, 28, 28, 1))
+        images = images.expand(-1, -1, -1, 3)
+        images = images.clamp(min=0.001, max=0.999)
+        images = (images * 256).byte()
+    elif (images.shape[-1] == 2*784):
+        # Colored MNIST
+        images = images.reshape((-1, 28, 28, 2))
+        images = torch.cat([images, torch.zeros_like(images[:,:,:,:1])], dim=3)
+        images = images.clamp(min=0.001, max=0.999)
+        images = (images * 256).byte()
+
+    assert(images.ndim == 4) # BHWC
+    assert(images.dtype == torch.uint8)
+    images = images.detach().cpu().numpy()
+    n_images = images.shape[0]
+    n_rows = int(np.sqrt(n_images))
+    while n_images % n_rows != 0:
+        n_rows -= 1
+    n_cols = n_images//n_rows
+    # Copy each image into its spot in the grid
+    height, width = images[0].shape[:2]
+    grid_image = np.zeros((height*n_rows, width*n_cols, 3), dtype='uint8')
+    for n, image in enumerate(images):
+        j = n // n_cols
+        i = n % n_cols
+        grid_image[j*height:j*height+height, i*width:i*width+width] = image
+    plt.imsave(path, grid_image)
